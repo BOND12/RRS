@@ -1,0 +1,481 @@
+# =============================================================================
+#  Makefile.linux — цели сборки RRS (симулятора) под Linux.
+#
+#  Здесь описаны все цели сборки: проверка окружения, зависимости, сам
+#  симулятор, дистрибутив, аддоны и очистка. Запускать файл следует через
+#  обёртку scripts/build_linux.sh — она только проверяет наличие утилиты
+#  make и передаёт ему все параметры:
+#
+#      ./scripts/build_linux.sh simulator BUILD_TYPE=Debug
+#      ./scripts/build_linux.sh dist
+#      ./scripts/build_linux.sh addons ADDONS_FLAGS=--only\ tep70
+#      ./scripts/build_linux.sh clean
+#
+#  Можно и напрямую: make -C <корень> -f scripts/Makefile.linux simulator
+#
+#  Цели:
+#    all             — то же, что simulator (цель по умолчанию);
+#    check           — проверка инструментов и системных библиотек;
+#    deps            — сборка зависимостей (VulkanSceneGraph, vsgXchange,
+#                      vsgImGui, sol2, SFML, KTX) в $(DEPS_PREFIX);
+#    simulator       — конфигурирование и сборка симулятора; если зависимости
+#                      ещё не собраны, они собираются автоматически;
+#    dist            — установка дистрибутива в $(DIST_DIR) (зависит от
+#                      simulator): cmake --install, артефакты, маршруты;
+#    addons          — загрузка аддонов из addons.yml в external_addons/;
+#    clean           — полная очистка: build, dist, bin, lib, modules,
+#                      plugins, .deps, external_addons;
+#    clean-artifacts — очистка только build и dist (зависимости и аддоны
+#                      сохраняются).
+#
+#  Переменные (задаются в командной строке make или в окружении):
+#    BUILD_DIR, DIST_DIR, BUILD_TYPE, JOBS, GENERATOR, CMAKE_ARGS,
+#    DEPS_PREFIX, DEPS_SRC_DIR, EXTRA_PREFIX_PATH,
+#    ROUTES, ROUTES_SRC, ADDONS_FLAGS, ADDONS_CONFIG, PYTHON,
+#    VSG_VERSION, VSGXCHANGE_VERSION, VSGIMGUI_VERSION, SOL2_VERSION,
+#    KTX_VERSION, SFML_VERSION.
+#
+#  Кодировка: UTF-8. Комментарии — на русском.
+# =============================================================================
+
+# Единый интерпретатор рецептов: bash с -euo pipefail, все строки рецепта
+# выполняются в одном процессе (общие переменные, cd, функции).
+SHELL := /bin/bash
+.SHELLFLAGS := -euo pipefail -c
+.ONESHELL:
+.DEFAULT_GOAL := all
+
+.PHONY: all check deps simulator dist addons clean clean-artifacts
+
+# --- Корень проекта --------------------------------------------------------
+# Определяется по расположению этого файла (scripts/Makefile.linux), поэтому
+# цели работают независимо от текущего каталога.
+MAKEFILE_ABS := $(abspath $(lastword $(MAKEFILE_LIST)))
+ROOT_DIR := $(patsubst %/,%,$(dir $(patsubst %/,%,$(dir $(MAKEFILE_ABS)))))
+export ROOT_DIR
+
+# --- Значения по умолчанию -------------------------------------------------
+BUILD_DIR      ?= $(ROOT_DIR)/build
+DIST_DIR       ?= $(ROOT_DIR)/dist
+BUILD_TYPE     ?= Release
+JOBS           ?= $(shell nproc 2>/dev/null || echo 2)
+DEPS_ROOT      ?= $(ROOT_DIR)/.deps
+DEPS_PREFIX    ?= $(DEPS_ROOT)/install
+DEPS_SRC_DIR   ?= $(DEPS_ROOT)/src
+EXTRA_PREFIX_PATH ?=
+ROUTES         ?= all
+ROUTES_SRC     ?= $(ROOT_DIR)/routes
+CMAKE_ARGS     ?=
+PYTHON         ?= python3
+ADDONS_CONFIG  ?= $(ROOT_DIR)/scripts/addonsBuilding/addons.yml
+ADDONS_FLAGS   ?=
+
+CMAKE ?= cmake
+GIT   ?= git
+
+# Генератор по умолчанию: Ninja, если он установлен.
+GENERATOR ?= $(shell command -v ninja >/dev/null 2>&1 && echo Ninja || echo "Unix Makefiles")
+
+# Версии и репозитории собираемых зависимостей.
+VSG_REPO       ?= https://github.com/vsg-dev/VulkanSceneGraph.git
+VSG_VERSION    ?= v1.1.16
+VSGXCHANGE_REPO    ?= https://github.com/vsg-dev/vsgXchange.git
+VSGXCHANGE_VERSION ?= v1.1.14
+VSGIMGUI_REPO      ?= https://github.com/maisvendoo/vsgImGui.git
+VSGIMGUI_VERSION   ?= master-RRS
+SOL2_REPO          ?= https://github.com/maisvendoo/sol2.git
+SOL2_VERSION       ?= c1f95a773c6f8f4fde8ca3efe872e7286afe4444
+SFML_REPO          ?= https://github.com/SFML/SFML.git
+SFML_VERSION       ?= 3.1.0
+KTX_REPO           ?= https://github.com/KhronosGroup/KTX-Software.git
+KTX_VERSION        ?= 983695c105618462b8e96458b378222e99faec98
+
+# CMake 4.x убрал совместимость с cmake_minimum_required < 3.5, а часть
+# конфигураций зависимостей (например OpenAL) составлена по старым правилам
+# и требует эмуляции политики CMake 3.5.
+CMAKE_MAJOR := $(shell $(CMAKE) --version 2>/dev/null | sed -n '1s/^[^0-9]*\([0-9][0-9]*\).*/\1/p')
+CMAKE_COMPAT := $(if $(filter 0 1 2 3,$(CMAKE_MAJOR)),,-DCMAKE_POLICY_VERSION_MINIMUM=3.5)
+
+# Конфигурации, по которым make судит о собранной зависимости.
+DEPS_STAMPS := \
+    $(DEPS_PREFIX)/lib/cmake/vsg/vsgConfig.cmake \
+    $(DEPS_PREFIX)/lib/cmake/vsgXchange/vsgXchangeConfig.cmake \
+    $(DEPS_PREFIX)/lib/cmake/vsgImGui/vsgImGuiConfig.cmake \
+    $(DEPS_PREFIX)/share/cmake/sol2/sol2-config.cmake \
+    $(DEPS_PREFIX)/lib/cmake/SFML/SFMLConfig.cmake \
+    $(DEPS_PREFIX)/lib/cmake/ktx/KtxConfig.cmake
+
+# --- Цель по умолчанию -----------------------------------------------------
+all: simulator
+
+# --- Проверка окружения ----------------------------------------------------
+# Повторяет проверку, которую раньше выполнял build_linux.sh: без cmake 3.29+,
+# Qt6 и системных библиотек сборка не начинается, а на экран выводится готовая
+# строка установки пакетов для Убунту/Debian.
+check:
+	@set -euo pipefail
+	missing=0
+	echo "==> Проверка инструментов и библиотек (префикс зависимостей: $(DEPS_PREFIX))"
+	for cmd in cmake ninja g++ git pkg-config; do
+	    if command -v "$$cmd" >/dev/null 2>&1; then
+	        echo "  [  OK  ] $$cmd: $$(command -v $$cmd)"
+	    else
+	        echo "  [НЕТ   ] $$cmd"
+	        missing=1
+	    fi
+	done
+	if command -v cmake >/dev/null 2>&1; then
+	    cmake_version="$$(cmake --version | sed -n '1s/.*[[:space:]]version[[:space:]]*//p')"
+	    if printf '%s\n%s\n' "3.29" "$$cmake_version" | sort -V -C 2>/dev/null; then
+	        echo "  [  OK  ] cmake $$cmake_version (>= 3.29)"
+	    else
+	        echo "  [ВЕРСИЯ] cmake $$cmake_version, требуется >= 3.29"
+	        missing=1
+	    fi
+	fi
+	config_dirs="$(DEPS_PREFIX)/lib/cmake $(DEPS_PREFIX)/lib64/cmake $(DEPS_PREFIX)/share/cmake /usr/local/lib/cmake /usr/lib/cmake /usr/share/cmake /usr/lib/x86_64-linux-gnu/cmake"
+	have_config() {
+	    for d in $$config_dirs; do
+	        [ -f "$$d/$$1" ] && return 0
+	    done
+	    return 1
+	}
+	have_pkg_config() {
+	    command -v pkg-config >/dev/null 2>&1 && pkg-config --exists "$$1" 2>/dev/null
+	}
+	if have_config "Qt6/Qt6Config.cmake"; then
+	    echo "  [  OK  ] Qt6"
+	    if ! have_config "Qt6LinguistTools/Qt6LinguistToolsConfig.cmake"; then
+	        echo "  [НЕТ   ] Qt6LinguistTools (пакет qt6-tools-dev)"
+	        missing=1
+	    fi
+	else
+	    echo "  [НЕТ   ] Qt6 (qt6-base-dev)"
+	    missing=1
+	fi
+	if have_config "Qt6Pdf/Qt6PdfConfig.cmake"; then
+	    echo "  [  OK  ] Qt6Pdf"
+	else
+	    echo "  [НЕТ   ] Qt6Pdf (qt6-pdf-dev)"
+	    missing=1
+	fi
+	if have_config "Qt6SerialBus/Qt6SerialBusConfig.cmake"; then
+	    echo "  [  OK  ] Qt6SerialBus"
+	else
+	    echo "  [НЕТ   ] Qt6SerialBus (qt6-serialbus-dev)"
+	    missing=1
+	fi
+	for spec in "openal:OpenAL (libopenal-dev)" \
+	            "assimp:assimp (libassimp-dev)" \
+	            "freetype2:freetype (libfreetype-dev)" \
+	            "lua5.4:Lua 5.4 (liblua5.4-dev)" \
+	            "vulkan:Vulkan (libvulkan-dev)"; do
+	    pc="$${spec%%:*}"
+	    label="$${spec#*:}"
+	    if have_pkg_config "$$pc"; then
+	        echo "  [  OK  ] $$label"
+	    else
+	        echo "  [НЕТ   ] $$label"
+	        missing=1
+	    fi
+	done
+	# glslang нужен VulkanSceneGraph: без него vsg отключает ShaderCompiler
+	# (VSG_SUPPORTS_ShaderCompiler) и собранные симулятор/вьюер падают с
+	# «VulkanSceneGraph not compiled with GLSLang».
+	if have_config "glslang/glslang-config.cmake"; then
+	    echo "  [  OK  ] glslang"
+	else
+	    echo "  [НЕТ   ] glslang (пакет glslang-dev) — без него не собираются шейдеры"
+	    missing=1
+	fi
+	# SFML 3.x: в Убунту 26.04 есть пакет libsfml-dev 3.0; если конфигурации
+	# нет, зависимость собирается из исходников целью deps.
+	if have_config "SFML/SFMLConfig.cmake"; then
+	    echo "  [  OK  ] SFML >= 3"
+	else
+	    echo "  [НЕТ   ] SFML >= 3 (будет собран из исходников: $(SFML_VERSION))"
+	fi
+	for spec in "vsg/vsgConfig.cmake:VulkanSceneGraph" \
+	            "vsgXchange/vsgXchangeConfig.cmake:vsgXchange" \
+	            "vsgImGui/vsgImGuiConfig.cmake:vsgImGui" \
+	            "sol2/sol2-config.cmake:sol2" \
+	            "ktx/KtxConfig.cmake:KTX"; do
+	    cfg="$${spec%%:*}"
+	    if have_config "$$cfg"; then
+	        echo "  [  OK  ] $${spec#*:}"
+	    else
+	        echo "  [НЕТ   ] $${spec#*:} (можно собрать: make deps)"
+	    fi
+	done
+	if [ "$$missing" -ne 0 ]; then
+	    echo
+	    echo "Обнаружены отсутствующие системные зависимости."
+	    cat <<'HINT'
+	Установите их пакетами дистрибутива, например для Убунту/Debian:
+	  sudo apt install build-essential ninja-build pkg-config git cmake \
+	      qt6-base-dev qt6-pdf-dev qt6-serialbus-dev qt6-l10n-tools qt6-tools-dev \
+	      libvulkan-dev glslang-dev libopenal-dev liblua5.4-dev \
+	      libassimp-dev libfreetype-dev zlib1g-dev libpng-dev \
+	      libx11-dev libxcb1-dev libxkbcommon-x11-dev libwayland-dev \
+	      libxrandr-dev libxcursor-dev libxi-dev libudev-dev \
+	      libsfml-dev sol2-dev
+	VulkanSceneGraph, vsgXchange, vsgImGui и KTX в репозиториях Убунту нет —
+	цель deps собирает их из исходников.
+	HINT
+	    exit 1
+	fi
+
+# --- Зависимости -----------------------------------------------------------
+# Каждая зависимость — отдельная файловая цель: make сам пропускает уже
+# установленные пакеты, а при сборке симулятора зависимости, собранные
+# ранее, не пересобираются.
+
+deps: $(DEPS_STAMPS)
+	@echo "==> Зависимости установлены в $(DEPS_PREFIX)"
+
+$(DEPS_PREFIX)/lib/cmake/vsg/vsgConfig.cmake:
+	@set -euo pipefail
+	mkdir -p "$(DEPS_PREFIX)" "$(DEPS_SRC_DIR)"
+	echo "==> VulkanSceneGraph $(VSG_VERSION)"
+	src="$(DEPS_SRC_DIR)/vsg"
+	if [ ! -d "$$src/.git" ]; then
+	    rm -rf "$$src"
+	    $(GIT) clone --depth 1 --branch "$(VSG_VERSION)" "$(VSG_REPO)" "$$src"
+	fi
+	$(CMAKE) -S "$$src" -B "$$src/build" -G "$(GENERATOR)" \
+	    -DCMAKE_BUILD_TYPE=Release \
+	    -DCMAKE_INSTALL_PREFIX="$(DEPS_PREFIX)" \
+	    -DCMAKE_PREFIX_PATH="$(DEPS_PREFIX)" \
+	    -DBUILD_SHARED_LIBS=ON \
+	    -DVSG_SUPPORTS_ShaderCompiler=ON \
+	    -DVSG_SUPPORTS_ShaderOptimizer=OFF \
+	    -DVSG_SUPPORTS_Windowing=ON \
+	    $(CMAKE_COMPAT)
+	$(CMAKE) --build "$$src/build" -j "$(JOBS)"
+	$(CMAKE) --install "$$src/build"
+
+$(DEPS_PREFIX)/lib/cmake/vsgXchange/vsgXchangeConfig.cmake:
+	@set -euo pipefail
+	mkdir -p "$(DEPS_PREFIX)" "$(DEPS_SRC_DIR)"
+	echo "==> vsgXchange $(VSGXCHANGE_VERSION)"
+	src="$(DEPS_SRC_DIR)/vsgXchange"
+	if [ ! -d "$$src/.git" ]; then
+	    rm -rf "$$src"
+	    $(GIT) clone --depth 1 --branch "$(VSGXCHANGE_VERSION)" "$(VSGXCHANGE_REPO)" "$$src"
+	fi
+	$(CMAKE) -S "$$src" -B "$$src/build" -G "$(GENERATOR)" \
+	    -DCMAKE_BUILD_TYPE=Release \
+	    -DCMAKE_INSTALL_PREFIX="$(DEPS_PREFIX)" \
+	    -DCMAKE_PREFIX_PATH="$(DEPS_PREFIX)" \
+	    -DBUILD_SHARED_LIBS=ON \
+	    $(CMAKE_COMPAT)
+	$(CMAKE) --build "$$src/build" -j "$(JOBS)"
+	$(CMAKE) --install "$$src/build"
+
+$(DEPS_PREFIX)/lib/cmake/vsgImGui/vsgImGuiConfig.cmake:
+	@set -euo pipefail
+	mkdir -p "$(DEPS_PREFIX)" "$(DEPS_SRC_DIR)"
+	echo "==> vsgImGui ($(VSGIMGUI_VERSION))"
+	src="$(DEPS_SRC_DIR)/vsgImGui"
+	if [ ! -d "$$src/.git" ]; then
+	    rm -rf "$$src"
+	    $(GIT) clone --depth 1 --recursive --shallow-submodules \
+	        --branch "$(VSGIMGUI_VERSION)" "$(VSGIMGUI_REPO)" "$$src"
+	fi
+	$(CMAKE) -S "$$src" -B "$$src/build" -G "$(GENERATOR)" \
+	    -DCMAKE_BUILD_TYPE=Release \
+	    -DCMAKE_INSTALL_PREFIX="$(DEPS_PREFIX)" \
+	    -DCMAKE_PREFIX_PATH="$(DEPS_PREFIX)" \
+	    -DBUILD_SHARED_LIBS=ON \
+	    $(CMAKE_COMPAT)
+	$(CMAKE) --build "$$src/build" -j "$(JOBS)"
+	$(CMAKE) --install "$$src/build"
+
+# sol2 в Убунту 26.04 есть пакетом sol2-dev, поэтому сначала проверяется
+# системная конфигурация — как это делал build_linux.sh.
+$(DEPS_PREFIX)/share/cmake/sol2/sol2-config.cmake:
+	@set -euo pipefail
+	found=""
+	for d in /usr/local/lib/cmake /usr/lib/cmake /usr/share/cmake /usr/lib/x86_64-linux-gnu/cmake; do
+	    if [ -f "$$d/sol2/sol2-config.cmake" ]; then
+	        found="$$d"
+	    fi
+	done
+	if [ -n "$$found" ]; then
+	    echo "==> sol2 есть в системе — сборка из исходников не нужна"
+	    exit 0
+	fi
+	mkdir -p "$(DEPS_PREFIX)" "$(DEPS_SRC_DIR)"
+	echo "==> sol2 ($(SOL2_VERSION))"
+	src="$(DEPS_SRC_DIR)/sol2"
+	if [ ! -d "$$src/.git" ]; then
+	    rm -rf "$$src"
+	    $(GIT) clone "$(SOL2_REPO)" "$$src"
+	fi
+	$(GIT) -C "$$src" checkout "$(SOL2_VERSION)"
+	$(CMAKE) -S "$$src" -B "$$src/build" -G "$(GENERATOR)" \
+	    -DCMAKE_BUILD_TYPE=Release \
+	    -DCMAKE_INSTALL_PREFIX="$(DEPS_PREFIX)" \
+	    -DSOL2_TESTS=OFF \
+	    -DSOL2_EXAMPLES=OFF \
+	    $(CMAKE_COMPAT)
+	$(CMAKE) --build "$$src/build" -j "$(JOBS)"
+	$(CMAKE) --install "$$src/build"
+
+# SFML 3.x: в Убунту 26.04 есть пакет libsfml-dev 3.0; если конфигурации
+# нет, собирается из исходников (только System и Window).
+$(DEPS_PREFIX)/lib/cmake/SFML/SFMLConfig.cmake:
+	@set -euo pipefail
+	found=""
+	for d in /usr/local/lib/cmake /usr/lib/cmake /usr/share/cmake /usr/lib/x86_64-linux-gnu/cmake; do
+	    if [ -f "$$d/SFML/SFMLConfig.cmake" ]; then
+	        found="$$d"
+	    fi
+	done
+	if [ -n "$$found" ]; then
+	    echo "==> SFML >= 3 есть в системе — сборка из исходников не нужна"
+	    exit 0
+	fi
+	mkdir -p "$(DEPS_PREFIX)" "$(DEPS_SRC_DIR)"
+	echo "==> SFML ($(SFML_VERSION), модули System и Window)"
+	src="$(DEPS_SRC_DIR)/SFML"
+	if [ ! -d "$$src/.git" ]; then
+	    rm -rf "$$src"
+	    $(GIT) clone --depth 1 --branch "$(SFML_VERSION)" "$(SFML_REPO)" "$$src"
+	fi
+	$(CMAKE) -S "$$src" -B "$$src/build" -G "$(GENERATOR)" \
+	    -DCMAKE_BUILD_TYPE=Release \
+	    -DCMAKE_INSTALL_PREFIX="$(DEPS_PREFIX)" \
+	    -DCMAKE_PREFIX_PATH="$(DEPS_PREFIX)" \
+	    -DBUILD_SHARED_LIBS=ON \
+	    -DSFML_BUILD_SYSTEM=ON \
+	    -DSFML_BUILD_WINDOW=ON \
+	    -DSFML_BUILD_GRAPHICS=OFF \
+	    -DSFML_BUILD_AUDIO=OFF \
+	    -DSFML_BUILD_NETWORK=OFF \
+	    -DSFML_BUILD_EXAMPLES=OFF \
+	    -DSFML_BUILD_TEST_SUITE=OFF \
+	    -DSFML_BUILD_DOC=OFF \
+	    $(CMAKE_COMPAT)
+	$(CMAKE) --build "$$src/build" -j "$(JOBS)"
+	$(CMAKE) --install "$$src/build"
+
+# KTX ставит конфиг в lib/cmake/ktx/KtxConfig.cmake (именно такое написание,
+# поэтому проверка идёт по фактическому пути).
+$(DEPS_PREFIX)/lib/cmake/ktx/KtxConfig.cmake:
+	@set -euo pipefail
+	mkdir -p "$(DEPS_PREFIX)" "$(DEPS_SRC_DIR)"
+	echo "==> KTX ($(KTX_VERSION))"
+	src="$(DEPS_SRC_DIR)/KTX-Software"
+	if [ ! -d "$$src/.git" ]; then
+	    rm -rf "$$src"
+	    $(GIT) clone "$(KTX_REPO)" "$$src"
+	    # --branch не принимает SHA-1, поэтому закреплённый коммит берётся
+	    # отдельно: fetch + checkout FETCH_HEAD.
+	    $(GIT) -C "$$src" fetch --depth 1 origin "$(KTX_VERSION)"
+	    $(GIT) -C "$$src" checkout -q FETCH_HEAD
+	    if [ -f "$$src/.gitmodules" ]; then
+	        $(GIT) -C "$$src" submodule update --init --recursive --depth 1
+	    fi
+	fi
+	$(CMAKE) -S "$$src" -B "$$src/build" -G "$(GENERATOR)" \
+	    -DCMAKE_BUILD_TYPE=Release \
+	    -DCMAKE_INSTALL_PREFIX="$(DEPS_PREFIX)" \
+	    -DCMAKE_PREFIX_PATH="$(DEPS_PREFIX)" \
+	    -DBUILD_SHARED_LIBS=ON \
+	    -DKTX_FEATURE_TESTS=OFF \
+	    -DKTX_FEATURE_TOOLS=OFF \
+	    -DKTX_FEATURE_DOC=OFF \
+	    -DKTX_FEATURE_JNI=OFF \
+	    -DKTX_FEATURE_PY=OFF \
+	    -DKTX_FEATURE_VK_UPLOAD=ON \
+	    -DKTX_FEATURE_GL_UPLOAD=OFF \
+	    $(CMAKE_COMPAT)
+	$(CMAKE) --build "$$src/build" -j "$(JOBS)"
+	$(CMAKE) --install "$$src/build"
+
+# --- Симулятор -------------------------------------------------------------
+# Зависимости, собранные ранее, make пропускает по файлам-конфигам, поэтому
+# цель simulator автоматически загружает и собирает только то, чего не хватает.
+simulator: check deps
+	@set -euo pipefail
+	echo "==> Конфигурирование RRS ($(BUILD_TYPE), генератор $(GENERATOR))"
+	$(CMAKE) -S "$(ROOT_DIR)" -B "$(BUILD_DIR)" -G "$(GENERATOR)" \
+	    -DCMAKE_BUILD_TYPE="$(BUILD_TYPE)" \
+	    -DCMAKE_PREFIX_PATH="$(DEPS_PREFIX)$(if $(EXTRA_PREFIX_PATH),;$(EXTRA_PREFIX_PATH))" \
+	    -DCMAKE_INSTALL_PREFIX="$(DIST_DIR)" \
+	    -DCLIENT_BUILD=ON \
+	    -DBUILD_TESTING=OFF \
+	    $(CMAKE_COMPAT) \
+	    $(CMAKE_ARGS)
+	echo "==> Сборка RRS ($(JOBS) задач)"
+	$(CMAKE) --build "$(BUILD_DIR)" -j "$(JOBS)"
+
+# --- Дистрибутив -----------------------------------------------------------
+dist: simulator
+	@set -euo pipefail
+	echo "==> Установка в $(DIST_DIR)"
+	$(CMAKE) --install "$(BUILD_DIR)"
+	dst="$(DIST_DIR)"
+	# cmake --install кладёт туда только SDK, lua-модули и маршруты:
+	# install(TARGETS) для bin/ и lib/ проект не объявляет. Кроме того, CMake
+	# задаёт EXECUTABLE_OUTPUT_PATH/LIBRARY_OUTPUT_PATH относительными путями
+	# ("../../bin", "../../lib"), поэтому артефакты ложатся в корень исходников.
+	# fonts/ и themes/ обязательны: FileSystem разрешает их как <корень>/fonts
+	# и <корень>/themes, а GUI (vsgImGui, Qt) без них пишет
+	# «Could not load font file!» и падает.
+	for name in bin lib modules plugins cfg data fonts themes; do
+	    src="$(ROOT_DIR)/$$name"
+	    if [ -d "$$src" ]; then
+	        mkdir -p "$$dst/$$name"
+	        cp -a "$$src/." "$$dst/$$name/"
+	        echo "Артефакты: $$name -> $$dst/$$name"
+	    fi
+	done
+	# Каталоги времени выполнения, которые на Windows создаёт windeploy.bat:
+	# logs/ (журналы) и screenshots/ (снимки экрана по F12). Каталог снимков
+	# обязателен заранее: ScreenshotWriter пишет файл без mkpath().
+	mkdir -p "$$dst/logs" "$$dst/screenshots"
+	echo "Каталоги времени выполнения: logs, screenshots"
+	# README для того, кто распаковал комплект.
+	if [ -f "$(ROOT_DIR)/docs/DIST_LINUX_README.md" ]; then
+	    cp -a "$(ROOT_DIR)/docs/DIST_LINUX_README.md" "$$dst/README.md"
+	    echo "README: docs/DIST_LINUX_README.md -> $$dst/README.md"
+	fi
+	# RPATH бинарников — $ORIGIN/../lib, поэтому нужны и библиотеки зависимостей.
+	if [ -d "$(DEPS_PREFIX)/lib" ]; then
+	    mkdir -p "$$dst/lib"
+	    cp -a "$(DEPS_PREFIX)/lib/." "$$dst/lib/"
+	    echo "Библиотеки зависимостей: $(DEPS_PREFIX)/lib -> $$dst/lib"
+	fi
+	# Маршруты нужны рядом с bin/ (лаунчер и симулятор ищут их в <корень>/routes).
+	. "$(ROOT_DIR)/scripts/routes-copy.sh"
+	rrs_copy_routes "$(ROUTES_SRC)" "$$dst/routes" "$(ROUTES)"
+	echo
+	echo "==> Готово: дистрибутив в $(DIST_DIR)"
+
+# --- Аддоны ----------------------------------------------------------------
+# Загрузка внешних аддонов (репозитории перечислены в addons.yml) в
+# external_addons/. Каталог входит в .gitignore и целиком удаляется целью clean.
+addons:
+	@set -euo pipefail
+	mkdir -p "$(ROOT_DIR)/external_addons/logs"
+	log_file="$(ROOT_DIR)/external_addons/logs/addons-$$(date +%Y%m%d-%H%M%S).log"
+	echo "==> Загрузка аддонов (лог: $$log_file)"
+	$(PYTHON) "$(ROOT_DIR)/scripts/addonsBuilding/addons.py" \
+	    --config "$(ADDONS_CONFIG)" \
+	    --project-root "$(ROOT_DIR)" \
+	    $(ADDONS_FLAGS) 2>&1 | tee -a "$$log_file"
+
+# --- Очистка ---------------------------------------------------------------
+clean:
+	@echo "==> Полная очистка"
+	rm -rf "$(BUILD_DIR)" "$(DIST_DIR)" "$(DEPS_ROOT)" \
+	    "$(ROOT_DIR)/external_addons"
+	rm -rf "$(ROOT_DIR)/bin" "$(ROOT_DIR)/lib" "$(ROOT_DIR)/modules" "$(ROOT_DIR)/plugins"
+	echo "Удалены: build, dist, .deps, external_addons, bin, lib, modules, plugins"
+
+clean-artifacts:
+	@echo "==> Очистка артефактов: build и dist (зависимости и аддоны сохранены)"
+	rm -rf "$(BUILD_DIR)" "$(DIST_DIR)"
+	echo "Удалены: build, dist"
