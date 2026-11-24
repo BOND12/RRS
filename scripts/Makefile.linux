@@ -267,7 +267,11 @@ $(DEPS_PREFIX)/lib/cmake/vsg/vsgConfig.cmake:
 	$(CMAKE) --build "$$src/build" -j "$(JOBS)"
 	$(CMAKE) --install "$$src/build"
 
-$(DEPS_PREFIX)/lib/cmake/vsgXchange/vsgXchangeConfig.cmake:
+# vsgXchange подключает декодер KTX по find_package(Ktx): если пакет не найден,
+# CMake подставляет src/ktx/ktx_fallback.cpp, который не умеет читать .ktx2.
+# Поэтому собираем vsgXchange строго после KTX-Software и явно указываем путь
+# к KtxConfig.cmake — иначе получаем библиотеку без поддержки KTX2.
+$(DEPS_PREFIX)/lib/cmake/vsgXchange/vsgXchangeConfig.cmake: $(DEPS_PREFIX)/lib/cmake/ktx/KtxConfig.cmake
 	@set -euo pipefail
 	mkdir -p "$(DEPS_PREFIX)" "$(DEPS_SRC_DIR)"
 	echo "==> vsgXchange $(VSGXCHANGE_VERSION)"
@@ -280,7 +284,9 @@ $(DEPS_PREFIX)/lib/cmake/vsgXchange/vsgXchangeConfig.cmake:
 	    -DCMAKE_BUILD_TYPE=Release \
 	    -DCMAKE_INSTALL_PREFIX="$(DEPS_PREFIX)" \
 	    -DCMAKE_PREFIX_PATH="$(DEPS_PREFIX)" \
+	    -DKtx_DIR="$(DEPS_PREFIX)/lib/cmake/ktx" \
 	    -DBUILD_SHARED_LIBS=ON \
+	    -DCMAKE_INSTALL_RPATH='$$ORIGIN' \
 	    $(CMAKE_COMPAT)
 	$(CMAKE) --build "$$src/build" -j "$(JOBS)"
 	$(CMAKE) --install "$$src/build"
