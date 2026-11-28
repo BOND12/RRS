@@ -87,9 +87,9 @@ GENERATOR ?= $(shell command -v ninja >/dev/null 2>&1 && echo Ninja || echo "Uni
 
 # Версии и репозитории собираемых зависимостей.
 VSG_REPO       ?= https://github.com/vsg-dev/VulkanSceneGraph.git
-VSG_VERSION    ?= v1.1.16
+VSG_VERSION    ?= v1.1.18
 VSGXCHANGE_REPO    ?= https://github.com/vsg-dev/vsgXchange.git
-VSGXCHANGE_VERSION ?= v1.1.14
+VSGXCHANGE_VERSION ?= v1.1.15
 VSGIMGUI_REPO      ?= https://github.com/maisvendoo/vsgImGui.git
 VSGIMGUI_VERSION   ?= master-RRS
 SOL2_REPO          ?= https://github.com/maisvendoo/sol2.git
