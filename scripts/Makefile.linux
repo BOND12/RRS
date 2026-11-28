@@ -9,12 +9,15 @@
 #      ./scripts/build_linux.sh simulator BUILD_TYPE=Debug
 #      ./scripts/build_linux.sh dist
 #      ./scripts/build_linux.sh addons ADDONS_FLAGS=--only\ tep70
+#      ./scripts/build_linux.sh dist-addons
 #      ./scripts/build_linux.sh clean
 #
 #  Можно и напрямую: make -C <корень> -f scripts/Makefile.linux simulator
 #
-#  Цели:
-#    all             — то же, что simulator (цель по умолчанию);
+#  Цели (порядок задаётся зависимостями, а не порядком в командной строке):
+#    all             — все этапы сборки (цель по умолчанию):
+#                      check + deps -> simulator -> dist -> addons ->
+#                      dist-addons;
 #    check           — проверка инструментов и системных библиотек;
 #    deps            — сборка зависимостей (VulkanSceneGraph, vsgXchange,
 #                      vsgImGui, sol2, SFML, KTX) в $(DEPS_PREFIX);
@@ -22,7 +25,11 @@
 #                      ещё не собраны, они собираются автоматически;
 #    dist            — установка дистрибутива в $(DIST_DIR) (зависит от
 #                      simulator): cmake --install, артефакты, маршруты;
-#    addons          — загрузка аддонов из addons.yml в external_addons/;
+#    addons          — загрузка аддонов из addons.yml в $(ADDONS_DIR) и их
+#                      сборка против SDK из $(SDK_DIR) (зависит от dist);
+#                      аддоны, которые не собрались, пропускаются с отчётом;
+#    dist-addons     — перенос собранных аддонов в $(DIST_DIR) (зависит от
+#                      addons): modules, cfg, data;
 #    clean           — полная очистка: build, dist, bin, lib, modules,
 #                      plugins, .deps, external_addons;
 #    clean-artifacts — очистка только build и dist (зависимости и аддоны
@@ -31,8 +38,8 @@
 #  Переменные (задаются в командной строке make или в окружении):
 #    BUILD_DIR, DIST_DIR, BUILD_TYPE, JOBS, GENERATOR, CMAKE_ARGS,
 #    DEPS_PREFIX, DEPS_SRC_DIR, EXTRA_PREFIX_PATH,
-#    ROUTES, ROUTES_SRC, ADDONS_FLAGS, ADDONS_CONFIG, PYTHON,
-#    VSG_VERSION, VSGXCHANGE_VERSION, VSGIMGUI_VERSION, SOL2_VERSION,
+#    ROUTES, ROUTES_SRC, ADDONS_CONFIG, ADDONS_FLAGS, ADDONS_DIR, SDK_DIR,
+#    PYTHON, VSG_VERSION, VSGXCHANGE_VERSION, VSGIMGUI_VERSION, SOL2_VERSION,
 #    KTX_VERSION, SFML_VERSION.
 #
 #  Кодировка: UTF-8. Комментарии — на русском.
@@ -45,7 +52,7 @@ SHELL := /bin/bash
 .ONESHELL:
 .DEFAULT_GOAL := all
 
-.PHONY: all check deps simulator dist addons clean clean-artifacts
+.PHONY: all check deps simulator dist addons dist-addons clean clean-artifacts
 
 # --- Корень проекта --------------------------------------------------------
 # Определяется по расположению этого файла (scripts/Makefile.linux), поэтому
@@ -69,6 +76,8 @@ CMAKE_ARGS     ?=
 PYTHON         ?= python3
 ADDONS_CONFIG  ?= $(ROOT_DIR)/scripts/addonsBuilding/addons.yml
 ADDONS_FLAGS   ?=
+ADDONS_DIR     ?= $(ROOT_DIR)/external_addons
+SDK_DIR        ?= $(DIST_DIR)/sdk
 
 CMAKE ?= cmake
 GIT   ?= git
@@ -106,7 +115,11 @@ DEPS_STAMPS := \
     $(DEPS_PREFIX)/lib/cmake/ktx/KtxConfig.cmake
 
 # --- Цель по умолчанию -----------------------------------------------------
-all: simulator
+# Все этапы сборки в порядке зависимостей:
+#   deps -> check -> simulator -> dist -> addons -> dist-addons
+# Цели очистки (clean, clean-artifacts) в all не входят. Каждая цель
+# выполняется один раз за запуск, поэтому повторов нет.
+all: dist-addons
 
 # --- Проверка окружения ----------------------------------------------------
 # Повторяет проверку, которую раньше выполнял build_linux.sh: без cmake 3.29+,
@@ -456,16 +469,63 @@ dist: simulator
 
 # --- Аддоны ----------------------------------------------------------------
 # Загрузка внешних аддонов (репозитории перечислены в addons.yml) в
-# external_addons/. Каталог входит в .gitignore и целиком удаляется целью clean.
-addons:
+# external_addons/ с последующей сборкой. Каталог входит в .gitignore
+# и целиком удаляется целью clean.
+#
+# Сборка аддонов требует установленного RRS (аддон ищет его через
+# find_package(RRS)), поэтому цель зависит от dist: там выкладывается
+# dist/sdk с RRSConfig.cmake. Сбой загрузки или сборки отдельного аддона
+# не прерывает работу — он попадает в отчёт и аддон пропускается.
+addons: dist
 	@set -euo pipefail
-	mkdir -p "$(ROOT_DIR)/external_addons/logs"
-	log_file="$(ROOT_DIR)/external_addons/logs/addons-$$(date +%Y%m%d-%H%M%S).log"
-	echo "==> Загрузка аддонов (лог: $$log_file)"
+	mkdir -p "$(ADDONS_DIR)/logs"
+	log_file="$(ADDONS_DIR)/logs/addons-$$(date +%Y%m%d-%H%M%S).log"
+	echo "==> Загрузка и сборка аддонов (лог: $$log_file)"
 	$(PYTHON) "$(ROOT_DIR)/scripts/addonsBuilding/addons.py" \
 	    --config "$(ADDONS_CONFIG)" \
 	    --project-root "$(ROOT_DIR)" \
+	    --build \
+	    --sdk "$(SDK_DIR)" \
+	    --prefix-path "$(DEPS_PREFIX)" \
+	    --build-jobs "$(JOBS)" \
 	    $(ADDONS_FLAGS) 2>&1 | tee -a "$$log_file"
+
+# --- Установка аддонов в дистрибутив ---------------------------------------
+# Аддоны не имеют правил install(), поэтому собранные файлы переносятся
+# вручную: modules/<цель>/*.so, cfg/ и data/ складываются в те же каталоги
+# dist, из которых симулятор читает технику и данные. Аддоны без собранных
+# файлов (сборка не удалась или аддон только с данными) пропускаются.
+dist-addons: addons
+	@set -euo pipefail
+	echo "==> Установка собранных аддонов в $(DIST_DIR)"
+	installed=0
+	skipped=0
+	for addon_dir in "$(ADDONS_DIR)"/*; do
+	    [ -d "$$addon_dir" ] || continue
+	    found=0
+	    for kind in modules cfg data; do
+	        [ -d "$$addon_dir/$$kind" ] && found=1
+	    done
+	    [ "$$found" -eq 1 ] || continue
+	    name="$$(basename "$$addon_dir")"
+	    copied=0
+	    for kind in modules cfg data; do
+	        if [ -d "$$addon_dir/$$kind" ]; then
+	            mkdir -p "$(DIST_DIR)/$$kind"
+	            cp -a "$$addon_dir/$$kind/." "$(DIST_DIR)/$$kind/"
+	            count="$$(find "$$addon_dir/$$kind" -type f | wc -l)"
+	            copied=$$((copied + count))
+	        fi
+	    done
+	    if [ "$$copied" -gt 0 ]; then
+	        echo "    $$name: файлов перенесено — $$copied"
+	        installed=$$((installed + 1))
+	    else
+	        echo "    $$name: собранных файлов нет — пропуск"
+	        skipped=$$((skipped + 1))
+	    fi
+	done
+	echo "==> Аддонов установлено: $$installed, пропущено: $$skipped"
 
 # --- Очистка ---------------------------------------------------------------
 clean:

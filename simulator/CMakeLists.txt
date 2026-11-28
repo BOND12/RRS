@@ -45,7 +45,9 @@ if (CLIENT_BUILD)
     add_subdirectory (modbus)
 endif()
 
-install(FILES ../common-headers/sound-signal.h DESTINATION sdk/include)
-install(FILES ../common-headers/key-symbols.h DESTINATION sdk/include)
-install(FILES ../common-headers/datetime.h DESTINATION sdk/include)
-install(FILES ../common-headers/autopilot-timetable.h DESTINATION sdk/include)
+# Общие заголовки ставятся в SDK целиком: установленные заголовки библиотек
+# включают их по имени (например vehicle-control-signals-container.h включает
+# control-priority.h), а внешние потребители SDK (аддоны) иначе не собираются.
+install(DIRECTORY ../common-headers/
+    DESTINATION sdk/include
+    FILES_MATCHING PATTERN "*.h")

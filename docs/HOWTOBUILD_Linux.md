@@ -62,8 +62,10 @@ dist/
 | `./scripts/build_docker.sh --routes none` | не копировать маршруты вообще |
 | `RRS_ROUTES=... ./scripts/build_docker.sh` | то же через переменные `RRS_ROUTES` / `RRS_ROUTES_SRC` |
 
-Те же `--routes` / `--no-routes` понимает и `../scripts/build_linux.sh` — сборка
-без Docker, с установкой в каталог: `./scripts/build_linux.sh --install dist --routes none`.
+Сборка без Docker описана ниже (раздел «Сборка без Docker»): обёртка
+`../scripts/build_linux.sh` вызывает цели `scripts/Makefile.linux`, например
+`./scripts/build_linux.sh` — все этапы, `./scripts/build_linux.sh dist ROUTES=none`
+— комплект без маршрутов.
 
 ## Ручная сборка в Docker (без скрипта)
 
@@ -83,9 +85,10 @@ cp -a routes/. dist/routes/
 
 Системные библиотеки ставятся пакетами дистрибутива, а то, чего в репозиториях
 Убунту нет — **VulkanSceneGraph, vsgXchange, vsgImGui и KTX** — собирается из
-исходников в локальный префикс `.deps/install`. Все шаги выполняет скрипт
-[`../scripts/build_linux.sh`](../scripts/build_linux.sh); ниже описано, что именно
-он делает и как повторить это вручную.
+исходников в локальный префикс `.deps/install`. Все шаги описаны целями
+[`../scripts/Makefile.linux`](../scripts/Makefile.linux); запускать их удобно
+через обёртку [`../scripts/build_linux.sh`](../scripts/build_linux.sh). Ниже
+описано, что именно делает каждая цель и как повторить это вручную.
 
 ### 1. Системные пакеты
 
@@ -98,7 +101,7 @@ sudo apt install build-essential ninja-build pkg-config git cmake \
     libassimp-dev libfreetype-dev zlib1g-dev libpng-dev \
     libx11-dev libxcb1-dev libxkbcommon-x11-dev libwayland-dev \
     libxrandr-dev libxcursor-dev libxi-dev libudev-dev \
-    libsfml-dev sol2-dev
+    libsfml-dev sol2-dev python3 python3-yaml
 ```
 
 | Пакеты | Что дают |
@@ -113,36 +116,67 @@ sudo apt install build-essential ninja-build pkg-config git cmake \
 | `liblua5.4-dev` | сценарии на Lua (`modules/lua`) |
 | `libassimp-dev`, `libfreetype-dev`, `zlib1g-dev`, `libpng-dev` | загрузка моделей, шрифты, сжатие текстур |
 | `libsfml-dev`, `sol2-dev` | SFML 3.0 для симулятора, Lua-биндинги |
+| `python3`, `python3-yaml` | загрузка и сборка аддонов: `scripts/addonsBuilding/addons.py` читает `addons.yml` |
 | `libx11-dev`, `libxcb1-dev`, `libxkbcommon-x11-dev`, `libwayland-dev`, `libxrandr-dev`, `libxcursor-dev`, `libxi-dev`, `libudev-dev` | окна и ввод Qt |
 
-Проверить, что всё нашлось (скрипт сверяет инструменты, CMake-конфиги и
+Проверить, что всё нашлось (цель `check` сверяет инструменты, CMake-конфиги и
 `pkg-config`-модули):
 
 ```bash
-./scripts/build_linux.sh --check-only
+./scripts/build_linux.sh check
 ```
 
 ### 2. Сборка скриптом
 
+Скрипт [`../scripts/build_linux.sh`](../scripts/build_linux.sh) — тонкая обёртка:
+он проверяет наличие утилиты `make` и передаёт ему все параметры. Сами цели
+сборки описаны в [`../scripts/Makefile.linux`](../scripts/Makefile.linux),
+поэтому их можно вызывать и напрямую:
+
 ```bash
-./scripts/build_linux.sh -j "$(nproc)"                       # зависимости + RRS
-./scripts/build_linux.sh -j "$(nproc)" --install "$PWD/dist" # то же + полный комплект
+make -C . -f scripts/Makefile.linux dist JOBS=16
 ```
 
-Что делает скрипт:
+| Цель | Что делает |
+|---|---|
+| `all` | все этапы по порядку зависимостей (цель по умолчанию) |
+| `check` | проверка инструментов и системных библиотек |
+| `deps` | сборка того, чего нет в пакетах, в `.deps/install` |
+| `simulator` | конфигурирование и сборка RRS в `build/` |
+| `dist` | `cmake --install`, артефакты и маршруты в `dist/` |
+| `addons` | загрузка и сборка аддонов в `external_addons/` |
+| `dist-addons` | перенос собранных аддонов в `dist/` |
+| `clean` | полная очистка (см. ниже) |
+| `clean-artifacts` | очистка только `build/` и `dist/` |
 
-1. проверяет системные зависимости (см. `--check-only`);
+```bash
+./scripts/build_linux.sh                            # все этапы, включая аддоны
+./scripts/build_linux.sh dist                       # только симулятор и дистрибутив
+./scripts/build_linux.sh all JOBS=16                # все этапы, 16 задач сборки
+./scripts/build_linux.sh simulator BUILD_TYPE=Debug # отладочная сборка
+./scripts/build_linux.sh addons ADDONS_FLAGS=--only\ tep70
+./scripts/build_linux.sh dist-addons                # аддоны в dist/
+```
+
+Порядок шагов задаётся зависимостями целей, а не порядком в командной строке:
+
+```
+all → dist-addons → addons → dist → simulator → check + deps
+```
+
+Каждая цель выполняется один раз за запуск, поэтому `all` — полный цикл без
+повторных шагов. Цели работают независимо от текущего каталога.
+
+Что делает `deps`:
+
+1. проверяет системные зависимости (цель `check`);
 2. собирает из исходников то, чего нет в пакетах, в `.deps/install`
    (исходники — в `.deps/src`): `vsg` v1.1.16, `vsgXchange` v1.1.14,
    `vsgImGui` (ветка `master-RRS`), `KTX` (коммит `983695c105618462b8e96458b378222e99faec98`),
-   а `sol2` и `SFML` — только если их системных CMake-конфигураций не нашлось;
-3. конфигурирует и собирает RRS в `build/` (CMake + Ninja);
-4. с `--install` выполняет `cmake --install`, копирует артефакты сборки
-   (`bin`, `lib`, `modules`, `plugins`, `cfg`, `data`) и маршруты в каталог
-   установки.
+   а `sol2` и `SFML` — только если их системных CMake-конфигураций не нашлось.
 
-Уже собранные зависимости повторно не собираются — повторный запуск продолжает
-с места остановки.
+Уже собранные зависимости повторно не собираются — по отметкам в `.deps`, так
+что повторный запуск продолжает с места остановки.
 
 Артефакты native-сборки кладутся **не** в `build/`: проект задаёт выходные пути
 относительно каталога сборки (`../../bin`, `../../lib`), поэтому исполняемые
@@ -151,43 +185,101 @@ sudo apt install build-essential ninja-build pkg-config git cmake \
 маршруты — в `routes/`, так что комплект для запуска собирать не нужно.
 
 Сам `cmake --install` кладёт только `sdk/` (CMake-пакет для сторонних модулей)
-и `modules/lua/`, поэтому `--install` дополнительно копирует `bin/`, `lib/`,
-`modules/`, `plugins/`, `cfg/`, `data/` и библиотеки зависимостей из
-`.deps/install/lib` — иначе в каталоге установки не было бы ни одного
-исполняемого файла. Маршруты попадают в `routes/` рядом.
+и `modules/lua/`, поэтому цель `dist` дополнительно копирует `bin/`, `lib/`,
+`modules/`, `plugins/`, `cfg/`, `data/`, `fonts/`, `themes/` и библиотеки
+зависимостей из `.deps/install/lib` — иначе в `dist/` не было бы ни одного
+исполняемого файла. Маршруты попадают в `dist/routes/`.
 
-Основные параметры: `--deps-only`, `--skip-deps`, `--rebuild-deps`, `--clean`,
-`clean` (полная очистка, см. ниже), `-t Debug`, `-b <каталог сборки>`,
-`--deps-prefix <каталог>`, `--generator <генератор>`,
-`--routes СПИСОК` / `--no-routes`, `--check-only`.
+Переменные задаются в командной строке make или в окружении:
 
-### 2.1 Полная очистка (цель `clean`)
+| Переменная | Назначение |
+|---|---|
+| `BUILD_DIR`, `DIST_DIR` | каталог сборки и каталог дистрибутива |
+| `BUILD_TYPE` | `Release` (по умолчанию) или `Debug` |
+| `JOBS`, `GENERATOR` | число задач сборки и генератор CMake (по умолчанию Ninja) |
+| `CMAKE_ARGS` | дополнительные параметры `cmake` |
+| `DEPS_PREFIX`, `DEPS_SRC_DIR`, `EXTRA_PREFIX_PATH` | префикс зависимостей, исходники, дополнительный `CMAKE_PREFIX_PATH` |
+| `ROUTES`, `ROUTES_SRC` | список маршрутов (`all` / `none` / имена) и их исходный каталог |
+| `ADDONS_CONFIG`, `ADDONS_FLAGS`, `ADDONS_DIR`, `SDK_DIR` | конфиг аддонов, флаги `addons.py`, каталог аддонов, каталог SDK |
+
+### 2.1 Аддоны (цели `addons` и `dist-addons`)
+
+Аддоны — отдельные репозитории (тепловозы, вагоны, оборудование), которые
+собираются как подключаемые модули RRS. Перечень, ссылки и ветки описаны в
+[`../scripts/addonsBuilding/addons.yml`](../scripts/addonsBuilding/addons.yml),
+загрузчик и сборщик — `../scripts/addonsBuilding/addons.py`.
+
+```bash
+./scripts/build_linux.sh addons                            # все аддоны
+./scripts/build_linux.sh addons ADDONS_FLAGS="--only tep70 --only chs2t"
+./scripts/build_linux.sh dist-addons                       # аддоны в dist/
+./scripts/build_linux.sh all                               # симулятор, dist и аддоны
+```
+
+Как это работает:
+
+1. репозиторий аддона загружается в `external_addons/<аддон>` (каталог в корне
+   репозитория, в git не входит; путь переопределяется переменной `ADDONS_DIR`);
+2. аддон собирается CMake-ом против SDK из `dist/sdk`, поэтому цель `addons`
+   зависит от `dist`. Сборка идёт в `external_addons/<аддон>/build`, готовые
+   модули остаются в `external_addons/<аддон>/modules/<цель>/*.so`;
+3. если сборка падает, а в `addons.yml` перечислены запасные ветки
+   (`branches`, например у ТЭП70 — `devel` и `devel-for-1.10.0`), загрузчик
+   пробует их по порядку: ветка переключается в том же клоне, каталог сборки
+   сбрасывается;
+4. цель `dist-addons` переносит модули, конфигурацию и данные аддонов в
+   `dist/modules/`, `dist/cfg/`, `dist/data/` — аддоны становятся частью
+   дистрибутива.
+
+Сборка не прерывается из-за одного неудачного аддона: остальные собираются, а в
+конце выводится отчёт — сколько загружено, собрано и пропущено, и по каждому
+пропущенному причина (последняя строка ошибки компиляции). Полный вывод —
+в `external_addons/logs/addons-<дата>-<время>.log`, состояние загрузки —
+в `external_addons/addons.manifest.json`. Код возврата равен 1 только если не
+удалось загрузить ни одного аддона.
+
+В `addons.yml` у аддона есть поля `name`, `url`, `branch`, `branches`,
+`commit` (пусто — последний коммит ветки), `subdirectory`, `license`,
+`homepage`, `clone` (глубина, подмодули, таймаут, повторы) и `build`
+(`enabled` — собирать ли, `install` — переносить ли в дистрибутив).
+
+### 2.2 Полная очистка (цель `clean`)
 
 ```bash
 ./scripts/build_linux.sh clean
 ```
 
-Удаляет всё, что появилось в результате сборки и установки:
+Удаляет всё, что появилось в результате сборки, установки и загрузки аддонов:
 
 | Что удаляется | Путь |
 |---|---|
-| Каталог сборки CMake | `build/` (или `--build-dir`, `RRS_BUILD_DIR`) |
+| Каталог сборки CMake | `build/` (или `BUILD_DIR`) |
 | Исполняемые файлы | `bin/` |
 | Библиотеки | `lib/` |
 | Подключаемые модули | `modules/` |
 | Плагины | `plugins/` |
-| Каталог установки | `dist/` (или путь из `--install`) |
+| Каталог дистрибутива | `dist/` (или `DIST_DIR`) |
 | Зависимости: исходники и сборки | `.deps/src/` |
 | Зависимости: установленные | `.deps/install/` |
 | Каталог зависимостей целиком | `.deps/` |
+| Аддоны: исходники, сборки и кеш | `external_addons/` в корне репозитория |
 
 `cfg/` и `data/` не трогаются: они входят в репозиторий, это исходные данные, а
 не результат сборки.
 
+Если нужно сохранить зависимости и аддоны, а удалить только результат сборки —
+цель `clean-artifacts`: она убирает `build/` и `dist/`, но не `.deps/` и не
+`external_addons/`:
+
+```bash
+./scripts/build_linux.sh clean-artifacts
+```
+
 Свои пути (если каталоги переопределялись при сборке):
 
 ```bash
-./scripts/build_linux.sh clean --install /opt/rrs -b build-debug --deps-prefix /opt/rrs-deps
+make -f scripts/Makefile.linux clean BUILD_DIR=build-debug \
+    DIST_DIR=/opt/rrs DEPS_PREFIX=/opt/rrs-deps
 ```
 
 Особенности:
@@ -198,10 +290,7 @@ sudo apt install build-essential ninja-build pkg-config git cmake \
 - есть защита от удаления `/` и корня репозитория;
 - после `clean` зависимости (VulkanSceneGraph, vsgXchange, vsgImGui, KTX)
   собираются заново — это 10–20 минут; если пересборка не нужна, собирайте
-  зависимости отдельно: `./scripts/build_linux.sh --deps-only`.
-
-Не путать с параметром `--clean`: тот удаляет только каталог сборки перед
-конфигурированием при обычном запуске.
+  зависимости отдельно: `./scripts/build_linux.sh deps`.
 
 ### 3. Ручная сборка (только cmake)
 
@@ -274,8 +363,8 @@ cd bin
   вычисляют как каталог на уровень выше рабочего (см. «Запуск собранного»);
 - маршруты берутся из `routes/` в корне репозитория;
 - шрифты и темы оформления берутся из `fonts/` и `themes/` корня комплекта: при
-  запуске из `dist/bin` эти каталоги должны лежать в `dist/` (скрипт копирует их
-  при `--install`), иначе вьювер пишет `Could not load font file!` и падает;
+  запуске из `dist/bin` эти каталоги должны лежать в `dist/` (цель `dist` копирует
+  их), иначе вьювер пишет `Could not load font file!` и падает;
 - нужен Vulkan-драйвер. Для проверки без видеокарты:
   `sudo apt install mesa-vulkan-drivers` и `LIBGL_ALWAYS_SOFTWARE=1`;
 - симулятор запускается так же: `./simulator --route=<имя маршрута> --scenario=hello_scenario`
@@ -294,7 +383,7 @@ cd bin
 - **`SFML 3.0` и `sol2 3.5`** берутся пакетами; из исходников скрипт собирает их
   только если системных конфигураций нет.
 - **Версии** зависимостей по умолчанию совпадают с Dockerfile и переопределяются
-  переменными окружения: `VSG_VERSION`, `VSGXCHANGE_VERSION`, `VSGIMGUI_VERSION`,
+  переменными сборки make: `VSG_VERSION`, `VSGXCHANGE_VERSION`, `VSGIMGUI_VERSION`,
   `SOL2_VERSION`, `KTX_VERSION`.
 - **Совместимость с системой**: нативная сборка работает только на Убунту 26.04
   и новее (glibc 2.42); Docker-сборка переносима между хостами.
@@ -306,7 +395,11 @@ cd bin
    и исходники, собранные вручную в `/opt/rrs-deps`:
    `vsg` v1.1.16, `vsgXchange` v1.1.14, `vsgImGui` (ветка `master-RRS`),
    `KTX-Software` (конкретный коммит `main`, см. ниже).
-2. **Стадия `RRS`** — сборка самого симулятора в `/opt/rrs-dist`.
+2. **Стадия `build`** — сборка самого симулятора (`cmake --build` и
+   `cmake --install`) в `/opt/rrs-dist`, копирование `bin/`, `lib/`, `modules/`,
+   `plugins/`, `cfg/`, `data/`, `fonts/`, `themes/` и `README.md` из
+   `docs/DIST_LINUX_README.md`. Аддоны в образе не собираются: их собирают
+   отдельно целью `addons` и переносят целью `dist-addons`.
 
 Слои кешируются: при изменении только кода RRS пересобирается последняя стадия.
 
@@ -344,8 +437,8 @@ cd dist/bin
   рабочего;
 - нужен X11 (или Wayland) и Vulkan-драйвер; для проверки без видеокарты —
   `LIBGL_ALWAYS_SOFTWARE=1` и `QT_QPA_PLATFORM=xcb` (Mesa/lavapipe);
-- маршруты лежат в `dist/routes/` — их копирует туда скрипт сборки
-  (см. `--routes`); лаунчер просматривает только вложенные каталоги, а название
+- маршруты лежат в `dist/routes/` — их копирует туда цель `dist`
+  (см. переменную `ROUTES`); лаунчер просматривает только вложенные каталоги, а название
   маршрута берёт из `description.xml` (тег `Route/Title`).
 
 Какие пакеты нужны в системе для такого запуска — в разделе «Что установить в
@@ -354,8 +447,8 @@ cd dist/bin
 ## Что установить в систему для запуска Docker-сборки
 
 В `dist/` лежат только артефакты сборки: бинарники, библиотеки RRS (`lib/`),
-плагины (`plugins/`) и данные (`cfg/`, `data/`, `routes/`). Системных библиотек там
-нет, поэтому на машине, где вы будете запускать собранное, нужен минимальный набор
+плагины (`plugins/`), модули аддонов (`modules/<аддон>/`) и данные (`cfg/`,
+`data/`, `routes/`). Системных библиотек там нет, поэтому на машине, где вы будете запускать собранное, нужен минимальный набор
 пакетов. Для Убунту 26.04 он такой:
 
 ```bash
@@ -393,8 +486,8 @@ sudo apt install libqt6core6t64 libqt6gui6 libqt6widgets6 libqt6network6 \
 
 ```bash
 cd dist
-for f in bin/* lib/*.so* modules/*.so plugins/*.so; do
-    LD_LIBRARY_PATH="$PWD/lib:$PWD/modules" ldd "$f" 2>/dev/null
+for f in bin/* lib/*.so* modules/*.so modules/*/*.so plugins/*.so; do
+    LD_LIBRARY_PATH="$PWD/lib:$PWD/modules:$PWD/modules/*" ldd "$f" 2>/dev/null
 done | awk '/not found/{print $1}' | sort -u
 ```
 
@@ -412,8 +505,8 @@ done | awk '/not found/{print $1}' | sort -u
 
 | Симптом | Причина / решение |
 |---|---|
-| `not compiled with GLSLang` при запуске вьювера | VulkanSceneGraph собран без компилятора шейдеров. Нативная сборка: не установлен `glslang-dev` — поставьте пакет и пересоберите зависимости (`./scripts/build_linux.sh --deps-only`). Docker-образ: пересоберите образ (`--no-cache`) |
-| `imgui-error ... Could not load font file!` | в каталоге установки нет `fonts/` (и `themes/`). Скрипт копирует их при `--install`; при ручной сборке скопируйте `fonts/` и `themes/` рядом с `bin/` |
+| `not compiled with GLSLang` при запуске вьювера | VulkanSceneGraph собран без компилятора шейдеров. Нативная сборка: не установлен `glslang-dev` — поставьте пакет и пересоберите зависимости (`./scripts/build_linux.sh deps`). Docker-образ: пересоберите образ (`--no-cache`) |
+| `imgui-error ... Could not load font file!` | в каталоге установки нет `fonts/` (и `themes/`). Цель `dist` копирует их; при ручной сборке скопируйте `fonts/` и `themes/` рядом с `bin/` |
 | `zsh: segmentation fault (core dumped) ./viewer` | следствие предыдущих двух пунктов (нет шейдеров и/или шрифта): сначала устраните `not compiled with GLSLang` и `Could not load font file!`, затем запускайте вьювер снова |
 | Двоичные файлы не запускаются на хосте | артефакты собраны на Убунту 26.04 (glibc 2.42); на более старом хосте нужен контейнер той же версии |
 | `error while loading shared libraries: libQt6*.so.6` | в системе нет пакетов Qt6 — см. «Что установить в систему для запуска Docker-сборки» |
@@ -422,15 +515,18 @@ done | awk '/not found/{print $1}' | sort -u
 | `Не найден .../Dockerfile.ubuntu26.04` | файл сборки переименован или отсутствует; путь можно задать через `RRS_DOCKERFILE` |
 | `Образ ... не найден` при `--no-build` | сначала соберите образ: `./scripts/build_docker.sh --build-only` |
 | Список маршрутов в лаунчере пуст | лаунчер запущен не из `bin/`; корень комплекта вычисляется от рабочего каталога, см. «Запуск собранного» |
-| В `dist/routes/` нет маршрутов | каталог `routes/` пуст или не загружен, либо задан `--routes none`; список задаётся `--routes`/`RRS_ROUTES` |
+| В `dist/routes/` нет маршрутов | каталог `routes/` пуст или не загружен, либо задан `ROUTES=none`; список задаётся переменными `ROUTES` и `ROUTES_SRC` |
 | `Could not find a package configuration file ... Qt6LinguistTools` (нативная сборка) | не установлен `qt6-tools-dev` — без него не собирается лаунчер |
-| `Compatibility with CMake < 3.5 has been removed` (нативная сборка) | старые конфигурации зависимостей; добавьте `-DCMAKE_POLICY_VERSION_MINIMUM=3.5` (скрипт `build_linux.sh` делает это сам) |
-| `Could not find vsg / vsgXchange / vsgImGui / KTX` (нативная сборка) | зависимости не собраны: `./scripts/build_linux.sh --deps-only` |
+| `Compatibility with CMake < 3.5 has been removed` (нативная сборка) | старые конфигурации зависимостей; добавьте `-DCMAKE_POLICY_VERSION_MINIMUM=3.5` (цель `simulator` добавляет его сама) |
+| `Could not find vsg / vsgXchange / vsgImGui / KTX` (нативная сборка) | зависимости не собраны: `./scripts/build_linux.sh deps` |
 | `module 'triggers_fabric' not found` (нативная сборка) | в сборочном дереве нет `modules/lua` — пересоберите RRS: `cmake --build build --target rrs_lua` |
+| Аддон не появился в `dist/modules/` | аддон не загрузился или не собрался: запустите `./scripts/build_linux.sh addons` и посмотрите отчёт в конце вывода; подробности — в `external_addons/logs/` |
 | Сообщения `proxychains ... DLL init` | посторонний шум перехватчика в окружении, к сборке не относится |
 
 ## Смежные документы
 
 - [BUILD_MACOS.md](BUILD_MACOS.md) — сборка на macOS;
 - [Руководство разработчика.pdf](Руководство%20разработчика.pdf) — сборка на Windows;
-- [README](../README.md) — список зависимостей и общие сведения.
+- [README](../README.md) — список зависимостей и общие сведения;
+- [addons.yml](../scripts/addonsBuilding/addons.yml) — перечень аддонов, их репозитории и ветки;
+- [Makefile.linux](../scripts/Makefile.linux) — цели сборки, переменные и порядок шагов.

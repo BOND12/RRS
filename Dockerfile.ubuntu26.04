@@ -169,6 +169,18 @@ ARG CLIENT_BUILD=ON
 # Каталог, куда складываются артефакты (cmake --install + бинарники)
 ARG RRS_ARTIFACT_PREFIX=/opt/rrs-dist
 
+# Инструменты аддонов: цель addons в scripts/Makefile.linux вызывает
+# scripts/addonsBuilding/addons.py, который читает addons.yml через PyYAML,
+# поэтому образу нужны python3 и модуль yaml. git и cmake в образе уже есть
+# (git установлен в стадии deps). Слой ставится до COPY, чтобы не зависеть
+# от изменений исходников и переиспользоваться из кеша.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        python3 \
+        python3-yaml \
+    && rm -rf /var/lib/apt/lists/* \
+    && python3 -c 'import yaml; print("PyYAML", yaml.__version__)'
+
 COPY . /src/rrs
 
 # Каталог сборки лежит внутри исходников не случайно: проект задаёт

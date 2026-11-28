@@ -29,3 +29,10 @@ dist/
 
 # Служебные скрипты и логи проверки запуска в контейнере
 .verify/
+
+# Байт-код Python (scripts/addonsBuilding/addons.py)
+__pycache__/
+*.pyc
+
+# Аддоны, загруженные целью addons (scripts/Makefile.linux): external_addons/
+external_addons/
